@@ -1,0 +1,7 @@
+assay,type,mutants,msa_neff_per_len,spearman_evo,spearman_entropy,top10_functional,random_functional
+BLAT_ECOLX_Stiffler_2015,OrganismalFitness,4996,177.98,0.452,0.374,1.0,0.5
+DYR_ECOLI_Thompson_2019,OrganismalFitness,2363,77.51,0.392,0.271,0.8,0.695
+KKA2_KLEPN_Melnikov_2014,OrganismalFitness,4960,298.65,0.275,0.251,0.8,0.643
+AMIE_PSEAE_Wrenbeck_2017,Activity,6227,89.1,0.213,0.15,0.5,0.5
+PTEN_HUMAN_Mighell_2018,Activity,7260,3.72,0.412,0.34,1.0,0.741
+TPMT_HUMAN_Matreyek_2018,Expression,3648,26.71,0.405,0.398,1.0,0.806
