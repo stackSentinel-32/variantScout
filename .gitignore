@@ -15,6 +15,7 @@ data/processed/
 *.pt
 *.bin
 *.onnx
+*.npy
 
 # OS files
 .DS_Store
