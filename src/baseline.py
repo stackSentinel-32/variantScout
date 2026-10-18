@@ -3,6 +3,7 @@ from Bio.Align import substitution_matrices
 from scipy.stats import spearmanr
 
 from .data import MSA_DIR, RESULTS, STARTER_SET, check_numbering, load_assay, load_reference
+from .esm import esm_mutation_scores, score_sequence
 from .msa import evo_scores, frequencies, load_msa, site_entropy
 from .plots import heatmap
 from .structure import compute_rsa_plddt
@@ -26,6 +27,11 @@ def score_assay(dms_id, ref):
     df["rsa"] = df.pos.map(rsa)
     df["plddt"] = df.pos.map(plddt)
 
+    from .esm import _load_model
+    tok, _ = _load_model()
+    logprobs = score_sequence(row.target_seq, row.UniProt_ID)
+    df["esm"] = esm_mutation_scores(logprobs, tok, df.pos.to_numpy(), df.wt, df.mt)
+
     top10 = df.nlargest(10, "evo")
     summary = {
         "assay": dms_id,
@@ -36,6 +42,7 @@ def score_assay(dms_id, ref):
         "rho_entropy": spearmanr(df.entropy, df.DMS_score)[0],
         "rho_blosum": spearmanr(df.blosum, df.DMS_score)[0],
         "rho_rsa": spearmanr(df.rsa, df.DMS_score)[0],
+        "rho_esm": spearmanr(df.esm, df.DMS_score)[0],
         "top10_fn": top10.DMS_score_bin.mean(),
         "random_fn": df.DMS_score_bin.mean(),
     }
