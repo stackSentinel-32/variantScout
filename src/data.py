@@ -9,6 +9,7 @@ MSA_DIR = RAW / "msa" / "DMS_msa_files"
 DMS_DIR = RAW / "dms" / "DMS_ProteinGym_substitutions"
 
 STARTER_SET = [
+    # --- original 10 ---
     "BLAT_ECOLX_Stiffler_2015",
     "DYR_ECOLI_Thompson_2019",
     "KKA2_KLEPN_Melnikov_2014",
@@ -19,7 +20,19 @@ STARTER_SET = [
     "TPK1_HUMAN_Weile_2017",
     "RNC_ECOLI_Weeks_2023",
     "OXDA_RHOTO_Vanella_2023_activity",
+    # --- 10 new (sorted by Neff/L) ---
+    "GFP_AEQVI_Sarkisyan_2016",         # 0.06
+    "P53_HUMAN_Kotler_2018",             # 0.37
+    "MK01_HUMAN_Brenan_2016",            # 25.98
+    "UBC9_HUMAN_Weile_2017",             # 55.33
+    "ADRB2_HUMAN_Jones_2020",            # 67.99
+    "RASH_HUMAN_Bandaru_2017",           # 125.77
+    "SUMO1_HUMAN_Weile_2017",            # 140.90
+    "CCDB_ECOLI_Tripathi_2016",          # 168.82
+    "CALM1_HUMAN_Weile_2017",            # 190.77
+    "IF1_ECOLI_Kelsic_2016",             # 536.24
 ]
+
 
 
 def load_reference():
