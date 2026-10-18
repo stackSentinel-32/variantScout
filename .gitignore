@@ -1,0 +1,21 @@
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.ipynb_checkpoints
+
+# Large Data & Model Weights (avoid bloating Git)
+data/raw/
+data/processed/
+*.pt
+*.bin
+*.onnx
+
+# OS files
+.DS_Store
+Thumbs.db
