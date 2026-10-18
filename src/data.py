@@ -15,6 +15,10 @@ STARTER_SET = [
     "AMIE_PSEAE_Wrenbeck_2017",
     "PTEN_HUMAN_Mighell_2018",
     "TPMT_HUMAN_Matreyek_2018",
+    "R1AB_SARS2_Flynn_2022",
+    "TPK1_HUMAN_Weile_2017",
+    "RNC_ECOLI_Weeks_2023",
+    "OXDA_RHOTO_Vanella_2023_activity",
 ]
 
 
