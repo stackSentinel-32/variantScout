@@ -1,0 +1,7 @@
+dropped,mean_spearman,delta
+none (full model),0.461,0.0
+evo,0.446,-0.015
+entropy,0.461,-0.001
+blosum,0.447,-0.015
+rsa,0.391,-0.07
+esm,0.459,-0.002

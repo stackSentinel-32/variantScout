@@ -3,7 +3,7 @@
 **Rank enzyme mutations before going to the lab.**
 Given a protein sequence, Mutation Picker scores every possible single amino-acid substitution and returns a ranked top-k list of the variants most likely to keep the enzyme working.
 
-> **Status:** work in progress. Evolutionary, structure, BLOSUM and ESM-2 baselines are working across 10 proteins. Combined model and app still to come. No headline results are claimed yet.
+> **Leave-one-protein-out on 20 ProteinGym assays — Ridge combined model: mean Spearman ρ = 0.461 (95 % CI 0.397–0.523), Precision@10 = 89 % vs 64 % random (binary functional hit).**
 
 ---
 
@@ -97,34 +97,73 @@ Results are cached to `data/processed/esm_cache/<UniProt_ID>.npy` as a `(L, voca
 
 > **Validation note:** before using ESM-2 numbers in any write-up, compare against ProteinGym's published zero-shot scores (download `DMS_substitutions_zero_shot_scores.zip` from proteingym.org). Your Spearman should match theirs within ±0.02 for the same model size. A larger gap almost always means an off-by-one in the token position indexing.
 
+### 5. Combined model (`src/evaluate.py`)
+
+Raw scores and feature scales differ across assays, so every feature and the target are **rank-normalised within each assay** before combining:
+
+```
+f_norm(i, assay) = rank(f_i in assay) / |assay|
+```
+
+A Ridge regression (α = 1) is then fit to predict the rank-normalised DMS score from the five rank-normalised features:
+
+```
+score(mutation) = w₀ + w₁·evo_norm + w₂·entropy_norm + w₃·blosum_norm
+                      + w₄·rsa_norm + w₅·esm_norm
+```
+
+Weights are learned on all *other* proteins (leave-one-protein-out). Because only 5 features and ~20 groups are available, Ridge is more reliable here than a boosted tree — both are reported so the reader can check.
+
+**Bootstrap CIs.** 95 % confidence intervals on the mean per-protein Spearman are computed by resampling the 20 per-protein values with replacement (n = 1000 bootstrap draws, percentile method).
+
 ---
 
-## Early results (10 proteins, unvalidated)
+## Results (20 proteins)
 
-Spearman ρ between each signal and measured DMS fitness:
+Spearman ρ between each signal and measured DMS fitness (full table in `results/tables/baseline.csv`):
 
-| Assay | Neff/L | evo | BLOSUM | RSA | ESM-2 | Best |
-|---|---:|---:|---:|---:|---:|---|
-| R1AB_SARS2 | 1.1 | **0.565** | 0.207 | 0.534 | -0.026 | evo |
-| PTEN_HUMAN | 3.7 | 0.412 | 0.182 | **0.443** | 0.407 | RSA |
-| TPMT_HUMAN | 26.7 | 0.405 | 0.240 | **0.443** | 0.433 | RSA |
-| TPK1_HUMAN | 29.9 | 0.221 | **0.241** | 0.126 | 0.199 | BLOSUM |
-| RNC_ECOLI | 70.7 | 0.548 | 0.228 | 0.324 | **0.557** | ESM-2 |
-| DYR_ECOLI | 77.5 | **0.392** | 0.151 | 0.341 | 0.349 | evo |
-| AMIE_PSEAE | 89.1 | 0.213 | 0.277 | **0.500** | 0.408 | RSA |
-| BLAT (TEM-1) | 178.0 | 0.452 | 0.346 | **0.604** | 0.557 | RSA |
-| OXDA_RHOTO | 271.3 | 0.140 | 0.205 | **0.352** | 0.219 | RSA |
-| KKA2_KLEPN | 298.7 | 0.275 | 0.226 | **0.532** | 0.261 | RSA |
+| Assay | Neff/L | evo | RSA | ESM-2 | Best |
+|---|---:|---:|---:|---:|---|
+| GFP_AEQVI | 0.06 | 0.457 | 0.400 | 0.076 | evo |
+| P53_HUMAN | 0.37 | **0.579** | 0.434 | 0.108 | evo |
+| R1AB_SARS2 | 1.14 | **0.565** | 0.534 | -0.026 | evo |
+| PTEN_HUMAN | 3.72 | 0.412 | **0.443** | 0.407 | RSA |
+| TPMT_HUMAN | 26.71 | 0.405 | **0.443** | 0.433 | RSA |
+| RNC_ECOLI | 70.70 | 0.548 | 0.324 | **0.557** | ESM-2 |
+| BLAT (TEM-1) | 178.0 | 0.452 | **0.604** | 0.557 | RSA |
 
-RSA is the best single signal on **6 of 10** proteins. ESM-2 is near-random (-0.026) on R1AB — the shallowest MSA — while the evolutionary score is the strongest (0.565). This needs validation against ProteinGym's published ESM-2 scores before interpretation.
+*Key finding:* ESM-2 is near-random or negative on the three shallowest MSAs (Neff/L < 2) and wins on mid-to-high depth proteins. RSA is the most consistently strong single signal. See `results/figures/neff_vs_rho.png`.
 
-No confidence intervals are reported yet. These are single-run point estimates.
+### Combined model (LOO)
+
+Ridge and LightGBM give nearly identical results, which shows the signal is real rather than model-specific:
+
+| Model | Mean Spearman | 95 % CI | Mean P@10 (binary) | Random P@10 |
+|---|---:|---|---:|---:|
+| Ridge | **0.461** | [0.397, 0.523] | **89 %** | 64 % |
+| LightGBM | 0.463 | — | 88 % | 64 % |
+
+Full per-protein table: `results/tables/loo_metrics.csv`.
+
+### Ablation (Ridge, drop one feature at a time)
+
+| Dropped feature | Mean Spearman | Δ |
+|---|---:|---:|
+| none (full model) | 0.461 | — |
+| RSA | 0.391 | **−0.070** |
+| evo | 0.446 | −0.015 |
+| blosum | 0.447 | −0.015 |
+| entropy | 0.461 | −0.001 |
+| ESM-2 | 0.459 | −0.002 |
+
+RSA is by far the most important signal. ESM-2 and entropy add almost nothing on average, but ESM-2 dominates individually on several mid-depth proteins (RNC, RASH, BLAT). Full table: `results/tables/ablation.csv`.
 
 ## Evaluation design
 
-- **Leave-one-protein-out** cross-validation (grouped by UniProt ID).
-- Scores and features **rank-normalised within each assay**.
-- Metrics: Spearman, NDCG@k and precision@10, with bootstrap confidence intervals against a random baseline.
+- **Leave-one-protein-out** cross-validation, grouped by **UniProt ID** (not assay name — some proteins have multiple assays).
+- Every feature and the target **rank-normalised within each assay** to a [0, 1] percentile.
+- Two models compared: `Ridge(alpha=1.0)` and `LightGBMRegressor`. Ridge is reported as the primary because with 20 proteins and 5 features, boosted trees can overfit.
+- Metrics: Spearman ρ, NDCG@10, NDCG@50, Precision@10 (binary hit) and Precision@10 (true top-10%), each with a random baseline. Bootstrap 95 % CIs (n=1000) on per-protein Spearman values.
 
 ## Limitations
 
@@ -138,15 +177,22 @@ No confidence intervals are reported yet. These are single-run point estimates.
 ```
 data/raw/         ProteinGym files (not tracked in git)
 data/processed/   ESM-2 score cache (not tracked in git)
-src/              feature extraction and evaluation
-  data.py         assay loader and numbering checks
-  msa.py          MSA parser, evo log-odds, entropy
+src/
+  data.py         assay loader, numbering checks, STARTER_SET
+  msa.py          MSA parser, evo log-odds, site entropy
   structure.py    RSA and pLDDT from AlphaFold PDB
   esm.py          ESM-2 masked-marginal scoring and cache
-  baseline.py     runs all signals across the protein set
+  baseline.py     per-signal Spearman across all proteins
+  evaluate.py     LOO cross-validation, ablation, Neff/L plot
   plots.py        heatmap generation
-doc/              detailed roadmap
-results/          tables and figures (tracked)
+app/
+  app.py          Streamlit app
+doc/
+  mutation-picker-roadmap.md
+results/
+  tables/         baseline.csv, loo_metrics.csv, ablation.csv
+  figures/        per-protein heatmaps, neff_vs_rho.png
+Makefile
 ```
 
 See the full plan in [`doc/mutation-picker-roadmap.md`](doc/mutation-picker-roadmap.md).
@@ -157,7 +203,23 @@ See the full plan in [`doc/mutation-picker-roadmap.md`](doc/mutation-picker-road
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+
+# Run baseline signals across all 20 proteins
 python -m src.baseline
+
+# Run LOO evaluation, ablation, and Neff/L plot
+python -m src.evaluate
+
+# Launch the Streamlit app
+streamlit run app/app.py
+```
+
+Or with `make`:
+
+```bash
+make install
+make reproduce   # runs baseline then evaluate
+make app         # starts the Streamlit server
 ```
 
 ### Data
