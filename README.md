@@ -197,12 +197,56 @@ Makefile
 
 See the full plan in [`doc/mutation-picker-roadmap.md`](doc/mutation-picker-roadmap.md).
 
+### Interactive Web App Features (`app/app.py`)
+
+- **Interactive 3D Structure Viewer (`py3Dmol`)**: Render AlphaFold PDB structures directly in Streamlit with dynamic coloring:
+  - **Candidate & Catalytic Sites**: Highlights top-10 recommended mutations in hot pink spheres and active site catalytic residues in yellow sticks.
+  - **pLDDT Confidence**: Colors by AlphaFold per-residue prediction confidence (Very High >90, Confident 70–90, Low 50–70, Very Low <50).
+  - **RSA Burial & Mean Tolerance**: Visualizes solvent exposure and average mutational tolerance across the backbone.
+- **ESM-2 Model Toggle**: Switch between `ESM-2 35M` (fast, lightweight) and `ESM-2 650M` (high accuracy for complex or shallow MSA targets), with persistent disk and memory caching.
+- **Combinatorial (Double) Mutant Scoring**: Predicts pairwise combinations using additive scoring with **3D C-alpha distance constraints**:
+  - Flags steric clash / direct contact risks ($d_{C\alpha} < 5$ Å).
+  - Highlights structurally independent pairs ($d_{C\alpha} > 10$ Å) for reliable additive fitness.
+- **Scientific Correctness Refinements**:
+  - **Sequence-reweighted $N_{eff}/L$ ($\theta = 0.8$)**: Cross-referenced against ProteinGym reference values.
+  - **Disordered Residue Filter (pLDDT $\ge$ 70 by default)**: Prevents floppy signal peptide tails from dominating top picks.
+  - **Position Diversity Cap**: Enforces library diversity by capping substitutions per site (default: max 2).
+  - **Confidence Tiers**: Categorizes candidates into 🟢 Tier 1 (Top 1%), 🟡 Tier 2 (Top 1%–5%), and ⚪ Tier 3 (5%–15%).
+  - **UniProt Accession Resolver**: Supports both UniProt Entry Names (`BLAT_ECOLX`) and primary accessions (`P62593`) via UniProt REST API.
+  - **Full Landscape Export**: Download both top recommendations and the full ~5,000 mutation landscape CSVs.
+
+---
+
+## Testing & Quality Assurance
+
+Run the comprehensive automated test suite:
+
+```powershell
+# Run all unit and integration tests
+pytest -v
+
+# Or with make
+make test
+```
+
+Test coverage includes:
+- `tests/test_numbering.py`: TEM-1 sequential vs Ambler mapping (M180T as #1 evolutionary stabilizer, catalytic S68A in bottom 1%).
+- `tests/test_msa.py`: MSA parsing, regularized column frequencies, sequence-reweighted $N_{eff}$ calculation, and ProteinGym reference checks.
+- `tests/test_structure.py`: AlphaFold PDB parsing, RSA, pLDDT, and C-alpha 3D Euclidean distances.
+- `tests/test_esm.py`: ESM-2 tokenizer and model loading, caching layer, and masked-marginal log-odds scoring.
+- `tests/test_combinatorial_and_3d.py`: 3D HTML viewer generation and double-mutant spatial clash evaluation.
+
+---
+
 ## Getting started
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+
+# Run automated tests
+pytest -v
 
 # Run baseline signals across all 20 proteins
 python -m src.baseline
@@ -218,6 +262,7 @@ Or with `make`:
 
 ```bash
 make install
+make test        # runs pytest across all test suites
 make reproduce   # runs baseline then evaluate
 make app         # starts the Streamlit server
 ```
