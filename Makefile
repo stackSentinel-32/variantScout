@@ -5,7 +5,11 @@
 PYTHON = .venv/Scripts/python.exe
 PIP    = .venv/Scripts/pip.exe
 
-.PHONY: install baseline evaluate app reproduce
+.PHONY: install baseline evaluate app test reproduce
+
+test:
+	$(PYTHON) -m pytest -v
+
 
 install:
 	python -m venv .venv
