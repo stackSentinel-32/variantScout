@@ -5,7 +5,9 @@ import pandas as pd
 from Bio.Align import substitution_matrices
 from scipy.stats import spearmanr
 
-from .data import MSA_DIR, RESULTS, ROOT, STARTER_SET, check_numbering, load_assay, load_reference
+from .cache_io import atomic_output
+from .benchmark_run import benchmark_run
+from .data import MSA_DIR, ROOT, STARTER_SET, check_numbering, load_assay, load_reference
 from .esm import _load_model, esm_mutation_scores, score_sequence
 from .msa import evo_scores, frequencies, load_msa, site_entropy
 from .plots import heatmap
@@ -26,7 +28,9 @@ def score_assay(dms_id: str, ref: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str,
     if parquet_path.exists():
         cached = pd.read_parquet(parquet_path)
         feat_cols = [c for c in ["evo", "entropy", "blosum", "rsa", "plddt", "esm"] if c in cached.columns]
-        df = df.merge(cached[["mutant", *feat_cols]], on="mutant", how="left")
+        if "mutant" not in cached or set(cached.mutant) != set(df.mutant):
+            raise ValueError(f"{dms_id}: cached mutation coverage differs from this assay")
+        df = df.merge(cached[["mutant", *feat_cols]], on="mutant", validate="one_to_one")
     else:
         query, msa = load_msa(MSA_DIR / row.MSA_filename)
         check_numbering(row, df, query)
@@ -46,42 +50,46 @@ def score_assay(dms_id: str, ref: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str,
         df["esm"] = esm_mutation_scores(logprobs, tok, df.pos.to_numpy(), df.wt, df.mt)
 
         # Save to parquet cache for subsequent runs
-        df.to_parquet(parquet_path, index=False)
+        with atomic_output(parquet_path) as pending:
+            df.to_parquet(pending, index=False)
 
-    top10 = df.nlargest(10, "evo")
+    # Guard: 'evo' may be absent when fast-path parquet predates the evo column
+    evo_col = df["evo"] if "evo" in df.columns else pd.Series(0.0, index=df.index)
+    top10 = df.dropna(subset=["evo"]).nlargest(10, "evo") if "evo" in df.columns else df.iloc[:0]
     summary: Dict[str, Any] = {
         "assay": dms_id,
         "type": row.coarse_selection_type,
         "mutants": len(df),
         "neff_L": row.MSA_Neff_L,
-        "rho_evo": float(spearmanr(df.evo, df.DMS_score)[0]),
-        "rho_entropy": float(spearmanr(df.entropy, df.DMS_score)[0]),
-        "rho_blosum": float(spearmanr(df.blosum, df.DMS_score)[0]),
-        "rho_rsa": float(spearmanr(df.rsa, df.DMS_score)[0]),
-        "rho_esm": float(spearmanr(df.esm, df.DMS_score)[0]),
-        "top10_fn": float(top10.DMS_score_bin.mean()),
-        "random_fn": float(df.DMS_score_bin.mean()),
+        "rho_evo": float(spearmanr(evo_col, df.DMS_score)[0]) if "evo" in df.columns else float("nan"),
+        "rho_entropy": float(spearmanr(df.entropy, df.DMS_score)[0]) if "entropy" in df.columns else float("nan"),
+        "rho_blosum": float(spearmanr(df.blosum, df.DMS_score)[0]) if "blosum" in df.columns else float("nan"),
+        "rho_rsa": float(spearmanr(df.rsa, df.DMS_score)[0]) if "rsa" in df.columns else float("nan"),
+        "rho_esm": float(spearmanr(df.esm, df.DMS_score)[0]) if "esm" in df.columns else float("nan"),
+        "top10_fn": float(top10.DMS_score_bin.mean()) if "DMS_score_bin" in top10.columns else float("nan"),
+        "top10_reason": "" if "evo" in df and df.evo.notna().any() else "Evolutionary ranking unavailable",
+        "random_fn": float(df.DMS_score_bin.mean()) if "DMS_score_bin" in df.columns else float("nan"),
     }
     return df, summary
 
 
 def main() -> None:
     ref = load_reference()
-    (RESULTS / "tables").mkdir(parents=True, exist_ok=True)
-    (RESULTS / "figures").mkdir(parents=True, exist_ok=True)
+    with benchmark_run("baseline", ref, STARTER_SET) as output:
+        write_baseline(ref, output)
+
+
+def write_baseline(ref, output):
     rows = []
 
     for dms_id in STARTER_SET:
-        if not (MSA_DIR / ref.loc[dms_id].MSA_filename).exists():
-            print("skipping", dms_id, "- MSA file not downloaded")
-            continue
         df, summary = score_assay(dms_id, ref)
         rows.append(summary)
-        heatmap(df, dms_id, RESULTS / "figures" / f"{dms_id}_heatmap.png")
+        heatmap(df, dms_id, output / "figures" / f"{dms_id}_heatmap.png")
         print("done", dms_id)
 
     table = pd.DataFrame(rows).round(3)
-    table.to_csv(RESULTS / "tables" / "baseline.csv", index=False)
+    table.to_csv(output / "tables" / "baseline.csv", index=False)
     print(table.to_string(index=False))
 
 
