@@ -4,13 +4,8 @@ Loads per-mutation feature tables (built by baseline.py), rank-normalises
 every feature and the target within each assay, then trains Ridge and
 LightGBM regressors under leave-one-protein-out cross-validation.
 
-Outputs
--------
-results/tables/loo_metrics.csv   per-protein Spearman, NDCG@10/50,
-                                  Precision@10 (two definitions), random
-                                  baselines, and 95 % bootstrap CI on Spearman
-results/tables/ablation.csv      drop-one-feature impact on mean Spearman
-results/figures/neff_vs_rho.png  key ESM-2 vs Neff/L scatter
+Run artifacts are written below results/runs/evaluation-<id>/.
+The tables contain assay metrics, protein bootstrap intervals, and ablation results.
 """
 
 import warnings
@@ -25,7 +20,8 @@ from sklearn.model_selection import LeaveOneGroupOut
 from sklearn.metrics import ndcg_score
 import lightgbm as lgb
 
-from .data import MSA_DIR, RESULTS, STARTER_SET, load_reference
+from .data import MSA_DIR, STARTER_SET, load_reference
+from .benchmark_run import benchmark_run
 from .baseline import score_assay
 
 FEATURES = ["evo", "entropy", "blosum", "rsa", "esm"]
@@ -40,7 +36,7 @@ def rank_normalise(series):
     return series.rank(pct=True)
 
 
-def build_dataset(ref):
+def build_dataset(ref, summaries=None):
     """Run score_assay for every protein and concatenate into one DataFrame.
 
     Returns a DataFrame with one row per single mutation and columns for
@@ -51,10 +47,16 @@ def build_dataset(ref):
     for dms_id in STARTER_SET:
         msa_path = MSA_DIR / ref.loc[dms_id].MSA_filename
         if not msa_path.exists():
-            print(f"  skipping {dms_id} – MSA not found")
-            continue
+            raise FileNotFoundError(f"{dms_id}: missing alignment {msa_path}")
         print(f"  loading {dms_id}")
-        df, _ = score_assay(dms_id, ref)
+        df, summary = score_assay(dms_id, ref)
+        missing = sorted(set(FEATURES) - set(df.columns))
+        if missing:
+            raise ValueError(f"{dms_id}: missing evaluation features {missing}")
+        if df[FEATURES].isna().any().any():
+            raise ValueError(f"{dms_id}: missing feature coverage")
+        if summaries is not None:
+            summaries.append(summary)
         df["assay"] = dms_id
         df["uniprot"] = ref.loc[dms_id].UniProt_ID
         frames.append(df[["assay", "uniprot", "DMS_score", "DMS_score_bin",
@@ -107,6 +109,24 @@ def bootstrap_ci(values, n=1000, alpha=0.05, rng=None):
 # LOO cross-validation
 # ---------------------------------------------------------------------------
 
+def protein_intervals(metrics):
+    """Give each protein equal weight, preserving paired assay baselines."""
+    paired = metrics.assign(binary_gain=metrics.p10_bin - metrics.rand_bin,
+                            top_decile_gain=metrics.p10_top - metrics.rand_top)
+    cols = ["spearman", "p10_bin", "p10_top", "binary_gain", "top_decile_gain"]
+    rows = []
+    for model, group in paired.groupby("model"):
+        proteins = group.groupby("uniprot")[cols].mean()
+        for column in cols:
+            values = proteins[column].dropna()
+            if values.empty:
+                continue
+            lo, hi = bootstrap_ci(values)
+            rows.append(dict(model=model, metric=column, proteins=len(values),
+                             mean=values.mean(), lower=lo, upper=hi))
+    return pd.DataFrame(rows)
+
+
 def make_ridge():
     return Ridge(alpha=1.0)
 
@@ -153,6 +173,9 @@ def evaluate_predictions(df):
 
         rows.append({
             "assay": assay,
+            "uniprot": sub["uniprot"].iat[0],
+            "measured": len(sub),
+            "picked": min(10, len(sub)),
             "spearman": rho,
             "ndcg10": ndcg10,
             "ndcg50": ndcg50,
@@ -172,7 +195,7 @@ def ablation(df, model_fn):
     """Drop one feature at a time; return mean Spearman change vs. full model."""
     full_df = run_loo(df, model_fn)
     full_metrics = evaluate_predictions(full_df)
-    full_mean = full_metrics["spearman"].mean()
+    full_mean = full_metrics.groupby("uniprot")["spearman"].mean().mean()
 
     rows = [{"dropped": "none (full model)", "mean_spearman": full_mean, "delta": 0.0}]
     for feat in FEATURES:
@@ -181,7 +204,7 @@ def ablation(df, model_fn):
         # zero out the dropped feature so the same LOO code works unchanged
         df_sub[feat] = 0.0
         pred_df = run_loo(df_sub, model_fn)
-        m = evaluate_predictions(pred_df)["spearman"].mean()
+        m = evaluate_predictions(pred_df).groupby("uniprot")["spearman"].mean().mean()
         rows.append({"dropped": feat, "mean_spearman": m, "delta": m - full_mean})
     return pd.DataFrame(rows)
 
@@ -204,7 +227,9 @@ def plot_neff_vs_rho(baseline_csv, out_path):
     fig, ax = plt.subplots(figsize=(9, 5))
     ax.set_xscale("log")
 
+    bl["rho_difference"] = bl["rho_esm"] - bl["rho_evo"]
     signal_style = {
+        "rho_difference": dict(marker="x", linestyle="-.", label="ESM-2 minus evolutionary"),
         "rho_evo":  dict(marker="o", linestyle="-",  label="Evolutionary (evo)"),
         "rho_rsa":  dict(marker="s", linestyle="--", label="RSA (structure)"),
         "rho_esm":  dict(marker="^", linestyle=":",  label="ESM-2 35M"),
@@ -251,7 +276,7 @@ def plot_neff_vs_rho(baseline_csv, out_path):
     ax.set_xlabel("MSA depth  (Neff / L,  log scale)", fontsize=10)
     ax.set_ylabel("Spearman ρ vs measured DMS fitness", fontsize=10)
     ax.set_title("Signal performance vs MSA depth\n"
-                 "ESM-2 fails on shallow MSAs; RSA is consistently strong",
+                 "Observed single-substitution assays",
                  fontsize=10)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
@@ -265,11 +290,16 @@ def plot_neff_vs_rho(baseline_csv, out_path):
 
 def main():
     ref = load_reference()
-    (RESULTS / "tables").mkdir(parents=True, exist_ok=True)
-    (RESULTS / "figures").mkdir(parents=True, exist_ok=True)
+    with benchmark_run("evaluation", ref, STARTER_SET) as output:
+        write_evaluation(ref, output)
+
+
+def write_evaluation(ref, output):
 
     print("Building per-mutation feature tables …")
-    raw = build_dataset(ref)
+    summaries = []
+    raw = build_dataset(ref, summaries)
+    pd.DataFrame(summaries).to_csv(output / "tables" / "baseline.csv", index=False)
     df = normalise_within_assay(raw)
 
     # --- LOO with Ridge ---
@@ -284,17 +314,10 @@ def main():
     lgbm_metrics = evaluate_predictions(lgbm_df)
     lgbm_metrics["model"] = "LightGBM"
 
-    # bootstrap CI on Ridge Spearman values (more stable than GBM with few groups)
-    rho_values = ridge_metrics["spearman"].values
-    ci_lo, ci_hi = bootstrap_ci(rho_values)
-
-    print(f"\nRidge  mean Spearman = {rho_values.mean():.3f}  "
-          f"95 % CI [{ci_lo:.3f}, {ci_hi:.3f}]")
-    print(f"LightGBM mean Spearman = {lgbm_metrics['spearman'].mean():.3f}")
-
     metrics = pd.concat([ridge_metrics, lgbm_metrics], ignore_index=True)
+    protein_intervals(metrics).to_csv(output / "tables" / "intervals.csv", index=False)
     metrics = metrics.round(3)
-    out_path = RESULTS / "tables" / "loo_metrics.csv"
+    out_path = output / "tables" / "loo_metrics.csv"
     metrics.to_csv(out_path, index=False)
     print(f"\n  saved {out_path}")
     print(metrics.to_string(index=False))
@@ -302,15 +325,15 @@ def main():
     # --- ablation (Ridge only – simpler and more honest with few groups) ---
     print("\nRunning ablation …")
     abl = ablation(df, make_ridge).round(3)
-    abl_path = RESULTS / "tables" / "ablation.csv"
+    abl_path = output / "tables" / "ablation.csv"
     abl.to_csv(abl_path, index=False)
     print(f"  saved {abl_path}")
     print(abl.to_string(index=False))
 
     # --- Neff/L plot ---
     plot_neff_vs_rho(
-        RESULTS / "tables" / "baseline.csv",
-        RESULTS / "figures" / "neff_vs_rho.png",
+        output / "tables" / "baseline.csv",
+        output / "figures" / "neff_vs_rho.png",
     )
 
 
