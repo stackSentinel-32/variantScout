@@ -8,8 +8,25 @@ AA: str = "ACDEFGHIKLMNPQRSTVWY"
 
 def load_msa(path: Union[str, Path]) -> Tuple[str, np.ndarray]:
     """Load an A2M/FASTA MSA into query string and numpy array of character bytes."""
-    blocks = open(path).read().split(">")[1:]
-    seqs = ["".join(b.splitlines()[1:]).upper().replace(".", "-") for b in blocks]
+    return parse_msa(Path(path).read_text(encoding="utf-8-sig"))
+
+
+def parse_msa(text: str) -> Tuple[str, np.ndarray]:
+    """Read individually delimited FASTA records before constructing the matrix."""
+    records = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith(">"):
+            records.append([])
+        elif not records:
+            raise ValueError("Alignment must start with a FASTA header.")
+        else:
+            records[-1].append(line)
+    seqs = ["".join(record).upper().replace(".", "-") for record in records]
+    if not seqs or not seqs[0] or any(len(row) != len(seqs[0]) for row in seqs):
+        raise ValueError("Each alignment record must have the same nonzero width.")
     msa = np.frombuffer("".join(seqs).encode(), dtype="S1").reshape(len(seqs), -1)
     return seqs[0], msa
 
@@ -41,8 +58,7 @@ def compute_neff(msa: np.ndarray, theta: float = 0.8) -> float:
     """Compute sequence-reweighted number of effective sequences (Neff) at identity threshold theta.
 
     Weights each sequence inversely by the number of sequences within (1 - theta)
-    identity distance. For large MSAs (N > 1500), a random subsample is used
-    to estimate Neff efficiently without excessive memory usage.
+    identity distance. For large MSAs (N > 1500), the estimate is withheld unless all rows are identical.
     """
     N, L = msa.shape
     if N <= 1:
@@ -50,16 +66,9 @@ def compute_neff(msa: np.ndarray, theta: float = 0.8) -> float:
 
     max_sample = 1500
     if N > max_sample:
-        rng = np.random.default_rng(42)
-        idx = rng.choice(N, size=max_sample, replace=False)
-        sub = msa[idx]
-        arr = np.ascontiguousarray(sub.view(np.uint8).reshape(max_sample, L))
-        weights = np.zeros(max_sample, dtype=np.float64)
-        min_matches = int(np.ceil(theta * L))
-        for i in range(max_sample):
-            matches = (arr[i] == arr).sum(axis=1)
-            weights[i] = 1.0 / np.sum(matches >= min_matches)
-        return float(weights.sum() * (N / max_sample))
+        if np.all(msa == msa[0]):
+            return 1.0
+        return float("nan")
     else:
         arr = np.ascontiguousarray(msa.view(np.uint8).reshape(N, L))
         weights = np.zeros(N, dtype=np.float64)
