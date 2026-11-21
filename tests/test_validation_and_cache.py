@@ -49,12 +49,19 @@ def test_cache_validation_prevents_stale_data_leakage(tmp_path: Path):
     # Create dummy dataframe matching test_seq
     rows = []
     for pos, wt in enumerate(test_seq, start=1):
-        rows.append({"pos": pos, "wt": wt, "mt": "A", "mutant": f"{wt}{pos}A", "score": 1.0})
+        for mt in test_seq:
+            if mt != wt:
+                rows.append(dict(pos=pos, wt=wt, mt=mt, mutant=f"{wt}{pos}{mt}", blosum=1.,
+                                 esm=0., rsa=0.5, plddt=90.))
     df_match = pd.DataFrame(rows)
-    df_match.to_parquet(parquet_path, index=False)
+    for invalid in [df_match.iloc[:-1], df_match.drop(columns="esm"),
+                    pd.concat([df_match.iloc[1:], df_match.iloc[[1]]])]:
+        invalid.to_parquet(parquet_path, index=False)
+        assert not is_valid_feature_cache(parquet_path, test_seq)
 
-    # 1. Exact match sequence should validate
-    assert is_valid_feature_cache(parquet_path, test_seq) is True
+    df_match.to_parquet(parquet_path, index=False)
+    assert is_valid_feature_cache(parquet_path, test_seq)
+    assert not is_valid_feature_cache(parquet_path, test_seq, with_alignment=True)
 
     # 2. Sequence with mismatch should be rejected
     mutated_seq = "ACDEFGHIKLMNPQRSTVWA"
