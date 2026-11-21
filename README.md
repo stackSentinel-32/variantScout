@@ -1,9 +1,8 @@
 # Mutation Picker
 
-**Rank enzyme mutations before going to the lab.**
-Given a protein sequence, Mutation Picker scores every possible single amino-acid substitution and returns a ranked top-k list of the variants most likely to keep the enzyme working.
+VariantScout studies how well model scores rank experimentally measured single substitutions within an assay. The interactive app also displays scores for unmeasured substitutions.
 
-> **Leave-one-protein-out on 20 ProteinGym assays — Ridge combined model: mean Spearman ρ = 0.461 (95 % CI 0.397–0.523), Precision@10 = 89 % vs 64 % random (binary functional hit).**
+**Retrospective result across 20 held-out proteins.** The average Ridge top ten contained 89.0% functional hits (random expectation 63.71%) and 16.0% top-decile hits (random expectation 13.475%). Mean Spearman correlation was 0.4614.
 
 ---
 
@@ -43,15 +42,15 @@ Every formula here corresponds directly to code in `src/`.
 For each MSA column (position) `i` and amino acid `a`, we compute a pseudocount frequency:
 
 ```
-f(i, a) = (count(i, a) + pseudo) / (N_sequences + 20 × pseudo)
+f(i, a) = (count(i, a) + 0.5) / (count_of_standard_residues(i) + 10)
 ```
 
-`pseudo = 0.01 × N_sequences` (relative pseudocount).
+Each of the 20 amino acid types receives a fixed pseudocount of 0.5. Gaps are excluded from the denominator.
 
 The **log-odds score** for a mutation `wt → mt` at position `i` is:
 
 ```
-evo_score(i, wt→mt) = log2( f(i, mt) / f(i, wt) )
+evo_score(i, wt→mt) = ln( f(i, mt) / f(i, wt) )
 ```
 
 A positive score means the mutant amino acid appears more often than the wild-type at that position across homologous sequences.
@@ -59,10 +58,10 @@ A positive score means the mutant amino acid appears more often than the wild-ty
 **Site entropy** (used as a separate signal):
 
 ```
-H(i) = -Σ_a f(i,a) · log2( f(i,a) )    (over 20 amino acids)
+H(i) = -Σ_a f(i,a) · ln( f(i,a) )    (over 20 amino acids)
 ```
 
-Low entropy → the position is conserved → changes are more likely to be damaging.
+Entropy is measured in nats. Low entropy → the position is conserved → changes are more likely to be damaging.
 
 ### 2. Relative Solvent Accessibility — RSA (`src/structure.py`)
 
@@ -93,9 +92,9 @@ esm_score(i, wt→mt) = log P(mt | sequence_masked_at_i)
 
 `+1` token offset accounts for ESM-2's `<cls>` start token.
 
-Results are cached to `data/processed/esm_cache/<UniProt_ID>.npy` as a `(L, vocab_size)` log-probability matrix, so the model runs at most once per protein.
+ESM matrices are stored in `data/processed/esm_cache/`. Existing entries lack complete model revision and input provenance.
 
-> **Validation note:** before using ESM-2 numbers in any write-up, compare against ProteinGym's published zero-shot scores (download `DMS_substitutions_zero_shot_scores.zip` from proteingym.org). Your Spearman should match theirs within ±0.02 for the same model size. A larger gap almost always means an off-by-one in the token position indexing.
+Reference comparisons use a named score column and report coverage and both correlations on matched measured single substitutions.
 
 ### 5. Combined model (`src/evaluate.py`)
 
@@ -112,7 +111,7 @@ score(mutation) = w₀ + w₁·evo_norm + w₂·entropy_norm + w₃·blosum_norm
                       + w₄·rsa_norm + w₅·esm_norm
 ```
 
-Weights are learned on all *other* proteins (leave-one-protein-out). Because only 5 features and ~20 groups are available, Ridge is more reliable here than a boosted tree — both are reported so the reader can check.
+Each fold learns weights from the other proteins. Results are reported for both Ridge and LightGBM.
 
 **Bootstrap CIs.** 95 % confidence intervals on the mean per-protein Spearman are computed by resampling the 20 per-protein values with replacement (n = 1000 bootstrap draws, percentile method).
 
@@ -132,18 +131,22 @@ Spearman ρ between each signal and measured DMS fitness (full table in `results
 | RNC_ECOLI | 70.70 | 0.548 | 0.324 | **0.557** | ESM-2 |
 | BLAT (TEM-1) | 178.0 | 0.452 | **0.604** | 0.557 | RSA |
 
-*Key finding:* ESM-2 is near-random or negative on the three shallowest MSAs (Neff/L < 2) and wins on mid-to-high depth proteins. RSA is the most consistently strong single signal. See `results/figures/neff_vs_rho.png`.
+The three shallowest alignments had weak ESM-2 correlations. A near-zero correlation also occurred at Neff/L 168.82. These observations do not establish a depth cutoff for a new protein.
 
-### Combined model (LOO)
+### Combined model on held-out measured substitutions
 
-Ridge and LightGBM give nearly identical results, which shows the signal is real rather than model-specific:
+| Model | Mean Spearman | Functional P@10 | Random functional | Top-decile P@10 | Random top-decile |
+|---|---:|---:|---:|---:|---:|
+| Ridge | 0.4614 | 89.0% | 63.71% | 16.0% | 13.475% |
+| LightGBM | 0.4631 | 89.0% | 63.71% | 24.0% | 13.475% |
 
-| Model | Mean Spearman | 95 % CI | Mean P@10 (binary) | Random P@10 |
-|---|---:|---|---:|---:|
-| Ridge | **0.461** | [0.397, 0.523] | **89 %** | 64 % |
-| LightGBM | 0.463 | — | 88 % | 64 % |
+Each assay contributes one precision value. The denominator is the number of measured picks, up to ten. Functional hits use the assay's binary label. Top-decile hits include ties at its 90th-percentile score. The random expectations are the corresponding frequencies among all measured singles in that assay. The saved table has one assay per protein. New evaluation runs average assays within each protein for bootstrap intervals and paired gains.
 
-Full per-protein table: `results/tables/loo_metrics.csv`.
+The filtered app shortlist, fallback model, 650M model and double-mutant heuristic have no matching held-out precision estimate in these tables. Percentile tiers describe relative rank.
+
+A separate GFP reporter check uses published ESM2_35M scores, fits Ridge on measured CALM1 and TPMT substitutions, and holds GFP out of training. Of 1,084 measured GFP singles, 1,051 passed the structural filter. With a cap of two picks per position, 20 of 20 picks met the functional threshold and 5 of 20 reached the assay-wide top decile. Across 2,000 random orderings under identical filters and caps, the corresponding mean rates were 91.59% and 9.69%. This single-reporter estimate uses measured candidates and a two-protein training cohort. The deployed app ranks unmeasured candidates and uses a different training cohort.
+
+Run `python -m src.gfp_shortlist_check` to reproduce the aggregate check. It uses the three assays' ProteinGym zero-shot CSVs under `data/raw/zero_shot/` in addition to the documented benchmark data. Its report under `results/runs/gfp-shortlist/` records source, dependency, and input versions. It verifies report contents on reuse and reads no legacy scoring caches.
 
 ### Ablation (Ridge, drop one feature at a time)
 
@@ -156,7 +159,7 @@ Full per-protein table: `results/tables/loo_metrics.csv`.
 | entropy | 0.461 | −0.001 |
 | ESM-2 | 0.459 | −0.002 |
 
-RSA is by far the most important signal. ESM-2 and entropy add almost nothing on average, but ESM-2 dominates individually on several mid-depth proteins (RNC, RASH, BLAT). Full table: `results/tables/ablation.csv`.
+Removing RSA produced the largest decrease in mean Spearman in the saved Ridge ablation.
 
 ## Evaluation design
 
@@ -203,68 +206,37 @@ See the full plan in [`doc/mutation-picker-roadmap.md`](doc/mutation-picker-road
   - **Candidate & Catalytic Sites**: Highlights top-10 recommended mutations in hot pink spheres and active site catalytic residues in yellow sticks.
   - **pLDDT Confidence**: Colors by AlphaFold per-residue prediction confidence (Very High >90, Confident 70–90, Low 50–70, Very Low <50).
   - **RSA Burial & Mean Tolerance**: Visualizes solvent exposure and average mutational tolerance across the backbone.
-- **ESM-2 Model Toggle**: Switch between `ESM-2 35M` (fast, lightweight) and `ESM-2 650M` (high accuracy for complex or shallow MSA targets), with persistent disk and memory caching.
+- **ESM-2 Model Toggle**: Switch between `ESM-2 35M` (fast, lightweight) and `ESM-2 650M`, with persistent disk and memory caching.
 - **Combinatorial (Double) Mutant Scoring**: Predicts pairwise combinations using additive scoring with **3D C-alpha distance constraints**:
   - Flags steric clash / direct contact risks ($d_{C\alpha} < 5$ Å).
-  - Highlights structurally independent pairs ($d_{C\alpha} > 10$ Å) for reliable additive fitness.
+  - Highlights structurally independent pairs ($d_{C\alpha} > 10$ Å) under the unvalidated additive heuristic.
 - **Scientific Correctness Refinements**:
-  - **Sequence-reweighted $N_{eff}/L$ ($\theta = 0.8$)**: Cross-referenced against ProteinGym reference values.
+  - **Sequence-reweighted $N_{eff}/L$ ($\theta = 0.8$)**: Computed from the submitted alignment. For large, nonidentical alignments the estimate is withheld.
   - **Disordered Residue Filter (pLDDT $\ge$ 70 by default)**: Prevents floppy signal peptide tails from dominating top picks.
   - **Position Diversity Cap**: Enforces library diversity by capping substitutions per site (default: max 2).
-  - **Confidence Tiers**: Categorizes candidates into 🟢 Tier 1 (Top 1%), 🟡 Tier 2 (Top 1%–5%), and ⚪ Tier 3 (5%–15%).
+  - **Rank Tiers**: Categorizes candidates into 🟢 Tier 1 (Top 1%), 🟡 Tier 2 (Top 1%–5%), and ⚪ Tier 3 (5%–15%).
   - **UniProt Accession Resolver**: Supports both UniProt Entry Names (`BLAT_ECOLX`) and primary accessions (`P62593`) via UniProt REST API.
   - **Full Landscape Export**: Download both top recommendations and the full ~5,000 mutation landscape CSVs.
 
 ---
 
-## Testing & Quality Assurance
+## Setup and offline tests
 
-Run the comprehensive automated test suite:
+Use Python 3.11 or 3.12. From the repository root, create an environment with `python -m venv .venv`. Activate it with `.\.venv\Scripts\Activate.ps1` in PowerShell or `source .venv/bin/activate` in Bash.
 
-```powershell
-# Run all unit and integration tests
-pytest -v
-
-# Or with make
-make test
+```sh
+python -m pip install -r requirements.txt
+python -m pytest -q
 ```
 
-Test coverage includes:
-- `tests/test_numbering.py`: TEM-1 sequential vs Ambler mapping (M180T as #1 evolutionary stabilizer, catalytic S68A in bottom 1%).
-- `tests/test_msa.py`: MSA parsing, regularized column frequencies, sequence-reweighted $N_{eff}$ calculation, and ProteinGym reference checks.
-- `tests/test_structure.py`: AlphaFold PDB parsing, RSA, pLDDT, and C-alpha 3D Euclidean distances.
-- `tests/test_esm.py`: ESM-2 tokenizer and model loading, caching layer, and masked-marginal log-odds scoring.
-- `tests/test_combinatorial_and_3d.py`: 3D HTML viewer generation and double-mutant spatial clash evaluation.
+The default suite uses synthetic fixtures and needs no benchmark downloads or pretrained weights. To list the data-dependent tests, run `python -m pytest --collect-only -m integration`. To run them, use `python -m pytest -m integration` after provisioning the reference CSV, assay CSV, MSA and structure files used by those tests and the 35M tokenizer and model weights. Some data-dependent tests skip when their files are absent.
 
----
+Launch the app with `python -m streamlit run app/app.py`. The benchmark commands `python -m src.baseline` and `python -m src.evaluate` preflight the starter cohort and write to unique directories under `results/runs/`. Each run records its input hashes and completion state in `manifest.json`. The published CSVs stay in `results/tables/`.
 
-## Getting started
+For Docker, build with `docker build -t variantscout .`. Local datasets, uploads and environments are excluded from the image. From the project root in PowerShell or Bash:
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-
-# Run automated tests
-pytest -v
-
-# Run baseline signals across all 20 proteins
-python -m src.baseline
-
-# Run LOO evaluation, ablation, and Neff/L plot
-python -m src.evaluate
-
-# Launch the Streamlit app
-streamlit run app/app.py
-```
-
-Or with `make`:
-
-```bash
-make install
-make test        # runs pytest across all test suites
-make reproduce   # runs baseline then evaluate
-make app         # starts the Streamlit server
+```sh
+docker run --rm -p 8501:8501 -v "${PWD}/data/raw:/app/data/raw:ro" -v variantscout-processed:/app/data/processed variantscout
 ```
 
 ### Data
