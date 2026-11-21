@@ -22,6 +22,8 @@ import pandas as pd
 import torch
 from transformers import AutoTokenizer, EsmForMaskedLM
 
+from .cache_io import atomic_output
+
 MODEL_NAME: str = "facebook/esm2_t12_35M_UR50D"
 AVAILABLE_MODELS: Dict[str, str] = {
     "35M": "facebook/esm2_t12_35M_UR50D",
@@ -90,9 +92,11 @@ def score_sequence(
         for i, pos in enumerate(range(start, end)):
             logprobs[pos] = torch.log_softmax(logits[i, pos + 1], dim=-1).numpy()
 
-    np.save(cache_path, logprobs)
+    with atomic_output(cache_path) as pending:
+        np.save(pending, logprobs)
     if model_tag == "35M" and not legacy_path.exists():
-        np.save(legacy_path, logprobs)
+        with atomic_output(legacy_path) as pending:
+            np.save(pending, logprobs)
     print(f"  cached ESM-2 ({model_tag}) scores for {uniprot_id}")
     return logprobs
 
@@ -115,18 +119,18 @@ def esm_mutation_scores(
     return logprobs[cols, mt_ids] - logprobs[cols, wt_ids]
 
 
-def compare_to_proteingym(df: pd.DataFrame, zero_shot_csv: Path) -> float:
-    """Compare your ESM-2 Spearman to ProteinGym's published value.
-
-    zero_shot_csv: path to the ESM2 prediction CSV from ProteinGym's zero-shot
-                   scores zip (data/raw/zero_shot/<assay_id>.csv).
-
-    Returns the Spearman of ProteinGym's scores against DMS_score.
-    """
+def compare_to_proteingym(df: pd.DataFrame, zero_shot_csv: Path, reference_column: str) -> dict:
+    """Report both correlations over the same finite, uniquely matched substitutions."""
     from scipy.stats import spearmanr
-    ref = pd.read_csv(zero_shot_csv)
-    merged = df.merge(ref[["mutant", "score"]], on="mutant", how="inner")
-    rho = float(spearmanr(merged["score"], merged["DMS_score"]).correlation)
-    print(f"ProteinGym ESM2 Spearman on this assay: {rho:.3f}")
-    return rho
 
+    ref = pd.read_csv(zero_shot_csv, usecols=["mutant", reference_column])
+    ref = ref.rename(columns={reference_column: "reference_score"})
+    singles = df.loc[~df.mutant.str.contains(":", regex=False), ["mutant", "esm", "DMS_score"]]
+    ref = ref.loc[~ref.mutant.str.contains(":", regex=False)]
+    matched = singles.merge(ref, on="mutant", validate="one_to_one")
+    matched = matched.replace([np.inf, -np.inf], np.nan).dropna()
+    return {
+        "measured": len(singles), "reference": len(ref), "matched": len(matched),
+        "local_rho": float(spearmanr(matched.esm, matched.DMS_score).statistic),
+        "reference_rho": float(spearmanr(matched.reference_score, matched.DMS_score).statistic),
+    }
