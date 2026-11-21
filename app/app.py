@@ -21,43 +21,38 @@ Both models are re-fit here on the baseline data every time the app starts,
 which is fast (~1 s) since all features are pre-cached.
 """
 
+import hashlib
 import io
 import itertools
 import pickle
+import re
 import sys
 import time
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
-import requests
-import py3Dmol
-import streamlit as st
-import streamlit.components.v1 as components
 import altair as alt
 import matplotlib
-
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import py3Dmol
+import requests
 import seaborn as sns
+import streamlit as st
+import streamlit.components.v1 as components
 from Bio.Align import substitution_matrices
 from scipy.stats import spearmanr
 from sklearn.linear_model import Ridge
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-import importlib
-for mod_name in ["src.msa", "src.structure", "src.esm", "src.baseline", "src.data"]:
-    if mod_name in sys.modules:
-        try:
-            importlib.reload(sys.modules[mod_name])
-        except Exception:
-            pass
-
-from src.msa import AA, frequencies, evo_scores, site_entropy, load_msa, compute_neff
+from src.msa import AA, frequencies, evo_scores, site_entropy, load_msa, parse_msa, compute_neff
 from src.structure import compute_rsa_plddt, STRUCT_DIR, extract_ca_coords, compute_ca_distance
+from src.cache_io import atomic_output
 from src.esm import score_sequence, esm_mutation_scores, _load_model, AVAILABLE_MODELS
 
 B62 = substitution_matrices.load("BLOSUM62")
@@ -71,31 +66,6 @@ _MODEL_CACHE = ROOT / "data" / "processed" / "baseline_models.pkl"
 # ---------------------------------------------------------------------------
 # helpers: reference Neff lookup and training set detection
 # ---------------------------------------------------------------------------
-
-@st.cache_data
-def get_reference_neff_dict():
-    """Load reference sequence-reweighted MSA_Neff_L values from ProteinGym."""
-    ref_path = ROOT / "data" / "raw" / "DMS_substitutions.csv"
-    if not ref_path.exists():
-        return {}
-    df = pd.read_csv(ref_path)
-    mapping = {}
-    for _, row in df.iterrows():
-        neff_l = row.get("MSA_Neff_L")
-        if pd.notna(neff_l):
-            val = float(neff_l)
-            if pd.notna(row.get("UniProt_ID")):
-                mapping[str(row["UniProt_ID"]).strip().upper()] = val
-            if pd.notna(row.get("DMS_id")):
-                mapping[str(row["DMS_id"]).strip().upper()] = val
-    # Add alias mappings for TEM-1
-    if "BLAT_ECOLX" in mapping:
-        mapping["P62593"] = mapping["BLAT_ECOLX"]
-        mapping["TEM-1"] = mapping["BLAT_ECOLX"]
-        mapping["TEM1"] = mapping["BLAT_ECOLX"]
-        mapping["TEM_1"] = mapping["BLAT_ECOLX"]
-    return mapping
-
 
 @st.cache_data
 def get_training_set_uniprots():
@@ -146,7 +116,7 @@ def load_baseline_models():
     for dms_id in STARTER_SET:
         msa_path = MSA_DIR / ref.loc[dms_id].MSA_filename
         if not msa_path.exists():
-            continue
+            raise FileNotFoundError(f"Incomplete training cohort: missing {dms_id} alignment.")
         df, _ = score_assay(dms_id, ref)
         df["assay"] = dms_id
         frames.append(df[["assay", "DMS_score", *FEATURES_FULL]])
@@ -168,8 +138,9 @@ def load_baseline_models():
 
     # Save for next time (instant load)
     _MODEL_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    with open(_MODEL_CACHE, "wb") as f:
-        pickle.dump((ridge_full, ridge_fallback), f)
+    with atomic_output(_MODEL_CACHE) as pending:
+        with pending.open("wb") as stream:
+            pickle.dump((ridge_full, ridge_fallback), stream)
 
     return ridge_full, ridge_fallback
 
@@ -191,7 +162,10 @@ TEM1_DEMO_SEQUENCE = (
 
 def parse_fasta(text: str) -> str:
     lines = text.strip().splitlines()
-    seq_lines = [l for l in lines if not l.startswith(">")]
+    lines = [line.strip() for line in lines if line.strip()]
+    if any(line.startswith(">") for line in lines[1:]):
+        raise ValueError("Submit exactly one FASTA record.")
+    seq_lines = [line for line in lines if not line.startswith(">")]
     return "".join(seq_lines).upper().replace(" ", "").replace("\t", "").replace("\r", "")
 
 
@@ -213,23 +187,26 @@ def validate_sequence(seq: str) -> tuple[bool, str]:
     return True, ""
 
 
-def is_valid_feature_cache(parquet_path: Path, seq: str) -> bool:
-    """Verify that a cached parquet file matches the input sequence exactly in length and wild-type residues."""
-    if not parquet_path.exists():
+def is_valid_feature_cache(parquet_path: Path, seq: str, with_alignment=False) -> bool:
+    """Require a complete, unique substitution table for this sequence and mode."""
+    if not parquet_path.is_file():
         return False
     try:
-        df_cached = pd.read_parquet(parquet_path)
-        if df_cached.empty or "pos" not in df_cached.columns or "wt" not in df_cached.columns:
+        table = pd.read_parquet(parquet_path)
+        features = FEATURES_FULL if with_alignment else FEATURES_FALLBACK
+        required = {"pos", "wt", "mt", "mutant", "plddt", *features}
+        if not required.issubset(table) or not np.isfinite(table[features].to_numpy()).all():
             return False
-        # Reconstruct WT sequence from cached positions
-        wt_pos = df_cached.drop_duplicates(subset=["pos"]).sort_values("pos")
-        if len(wt_pos) != len(seq):
+        if not seq or len(table) != len(seq) * (len(AA) - 1):
             return False
-        if int(wt_pos["pos"].min()) != 1 or int(wt_pos["pos"].max()) != len(seq):
+        if not pd.api.types.is_integer_dtype(table.pos) or not table.pos.between(1, len(seq)).all():
             return False
-        reconstructed = "".join(wt_pos["wt"])
-        return reconstructed == seq
-    except Exception:
+        if table.duplicated(["pos", "mt"]).any():
+            return False
+        expected_wt = table.pos.map(dict(enumerate(seq, 1)))
+        return bool((table.wt.eq(expected_wt) & table.mt.isin(list(AA)) & table.mt.ne(table.wt)
+                     & table.mutant.eq(table.wt + table.pos.astype(str) + table.mt)).all())
+    except (OSError, ValueError, TypeError):
         return False
 
 
@@ -274,12 +251,12 @@ def fetch_alphafold_pdb(uniprot_id):
         entry.upper() if entry else "",
         acc.upper() if acc else "",
     ]))
-    candidates = [c for c in candidates if c]
+    candidates = [c for c in candidates if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", c or "")]
 
     # 1. Check local ProteinGym AF2 cache first
     for candidate in candidates:
         p = STRUCT_DIR / f"{candidate}.pdb"
-        if p.exists():
+        if p.resolve().parent == STRUCT_DIR.resolve() and p.is_file():
             return p.read_text()
 
     # 2. Check AlphaFold API for latest structure
@@ -470,24 +447,20 @@ def make_interactive_heatmap(df, seq, score_col, title, has_evo=True):
 
 
 # ---------------------------------------------------------------------------
-# helper functions: confidence tiers, diversity cap, feature attribution
+# helper functions: rank tiers, diversity cap, feature attribution
 # ---------------------------------------------------------------------------
 
 def assign_confidence_tiers(df, score_col):
-    """Group candidates into 3 confidence tiers based on predicted score percentile:
-    🟢 Tier 1: High Confidence (Top 1%)
-    🟡 Tier 2: Moderate Confidence (Top 1% - 5%)
-    ⚪ Tier 3: Tolerated / Low Confidence (Top 5% - 15%)
-    """
+    """Label relative score percentiles within this submission."""
     pct = df[score_col].rank(pct=True)
     tiers = []
     for p in pct:
         if p >= 0.99:
-            tiers.append("🟢 Tier 1 (High)")
+            tiers.append("🟢 Tier 1 (≥99th percentile)")
         elif p >= 0.95:
-            tiers.append("🟡 Tier 2 (Moderate)")
+            tiers.append("🟡 Tier 2 (95th–99th percentile)")
         elif p >= 0.85:
-            tiers.append("⚪ Tier 3 (Tolerated)")
+            tiers.append("⚪ Tier 3 (85th–95th percentile)")
         else:
             tiers.append("Low (< 85%)")
     return tiers, pct
@@ -551,7 +524,7 @@ def make_feature_attribution_chart(model, feats, feat_row, mutant_name):
 
 
 def format_candidates_table(candidate_df, score_col, tier_col, feat_cols, max_per_pos=2, top_n=20):
-    """Format and sort top candidate recommendations with diversity cap and confidence tiers."""
+    """Format and sort top candidate recommendations with diversity cap and rank tiers."""
     df_sorted = candidate_df.sort_values(by=score_col, ascending=False)
     picked = apply_diversity_cap(df_sorted, max_per_pos=max_per_pos, top_n=top_n)
 
@@ -770,11 +743,11 @@ def generate_combinatorial_mutants(
     tiers = []
     for p in pct:
         if p >= 0.90:
-            tiers.append("🟢 Tier 1 (High)")
+            tiers.append("🟢 Tier 1 (≥90th percentile)")
         elif p >= 0.70:
-            tiers.append("🟡 Tier 2 (Moderate)")
+            tiers.append("🟡 Tier 2 (70th–90th percentile)")
         else:
-            tiers.append("⚪ Tier 3 (Tolerated)")
+            tiers.append("⚪ Tier 3 (<70th percentile)")
     out_df.insert(0, "Tier", tiers)
 
     return out_df
@@ -908,18 +881,12 @@ def render_3d_tab(pdb_text, clean_id, entry_name, is_tem1, top_rec_df, df, seq, 
 
 
 def render_combinatorial_tab(candidate_df, target_score_col, ca_coords, clean_id, entry_name):
+    st.info("Double-mutant scores are an unvalidated additive heuristic.")
     st.subheader(f"🧪 Combinatorial (Double) Mutants — {entry_name or clean_id}")
     st.caption(
         "Combines top-scoring single mutations using the additive approximation "
         "(sum of model scores + independent site conservation and ESM log-odds). "
-        "Filters or flags adjacent residues within 5Å to avoid steric clashes and negative epistasis."
-    )
-
-    st.info(
-        "💡 **Additive Approximation Principle**: Beneficial mutations at spatially separated sites "
-        "(Cα distance ≥ 5.0 Å) tend to act independently, making their combined fitness effects largely additive. "
-        "Mutations in direct physical contact (< 5.0 Å) carry high risk of packing conflicts, backbone clashes, "
-        "or deleterious non-linear epistatic interactions."
+        "Displays pairwise distances where coordinates are available."
     )
 
     col_pool, col_dist, col_tier = st.columns([2, 2, 2])
@@ -946,7 +913,7 @@ def render_combinatorial_tab(candidate_df, target_score_col, ca_coords, clean_id
         only_tolerant = st.checkbox(
             "Only include Tier 1 & 2 singles",
             value=True,
-            help="Restricts combination candidates strictly to High and Moderate confidence single variants.",
+            help="Restricts combination candidates to the two highest percentile tiers.",
             key="comb_only_tolerant",
         )
 
@@ -1003,7 +970,7 @@ def render_combinatorial_tab(candidate_df, target_score_col, ca_coords, clean_id
                 ),
                 tooltip=[
                     alt.Tooltip("pair:N", title="Double Mutant"),
-                    alt.Tooltip("Tier:N", title="Confidence Tier"),
+                    alt.Tooltip("Tier:N", title="Rank tier"),
                     alt.Tooltip("score_double:Q", title="Additive Score", format=".3f"),
                     alt.Tooltip("ca_dist:Q", title="Cα Distance (Å)", format=".1f"),
                     alt.Tooltip("mut1:N", title="Mutation 1"),
@@ -1039,6 +1006,17 @@ def render_combinatorial_tab(candidate_df, target_score_col, ca_coords, clean_id
 # Streamlit UI
 # ---------------------------------------------------------------------------
 
+def reset_submission_inputs(use_demo):
+    state = st.session_state
+    state["fasta_input_val"] = TEM1_DEMO_SEQUENCE if use_demo else ""
+    state["uniprot_id_val"] = "P62593" if use_demo else ""
+    state["use_demo_msa_val"] = use_demo
+    # A file uploader needs a new widget key to discard the browser's attachment.
+    state["upload_generation"] = state.get("upload_generation", 0) + 1
+    if not use_demo:
+        state.pop("completed_submission", None)
+
+
 def main():
     st.set_page_config(page_title="Mutation Picker", layout="wide")
     st.title("🧬 Mutation Picker")
@@ -1058,36 +1036,32 @@ def main():
 
         col_demo1, col_demo2 = st.columns(2)
         with col_demo1:
-            if st.button("🧪 Load TEM-1 Demo", use_container_width=True, help="Load canonical 286-aa TEM-1 sequence & UniProt P62593"):
-                st.session_state["fasta_input_val"] = TEM1_DEMO_SEQUENCE
-                st.session_state["uniprot_id_val"] = "P62593"
-                st.session_state["use_demo_msa_val"] = True
-                st.rerun()
+            st.button("🧪 Load TEM-1 Demo", use_container_width=True,
+                      help="Load canonical 286-aa TEM-1 sequence & UniProt P62593",
+                      on_click=reset_submission_inputs, args=(True,))
         with col_demo2:
-            if st.button("🔄 Clear", use_container_width=True, help="Clear input fields"):
-                st.session_state["fasta_input_val"] = ""
-                st.session_state["uniprot_id_val"] = ""
-                st.session_state["use_demo_msa_val"] = False
-                st.rerun()
+            st.button("🔄 Clear", use_container_width=True, help="Clear input fields",
+                      on_click=reset_submission_inputs, args=(False,))
 
         fasta_text = st.text_area(
             "Protein sequence (FASTA or raw)",
-            value=st.session_state["fasta_input_val"],
+            key="fasta_input_val",
             height=150,
             placeholder=">MyProtein\nMKTAYIAKQRQ...",
             help="Standard 20 amino acids (ACDEFGHIKLMNPQRSTVWY). Sequential numbering (1-indexed).",
         )
-        st.session_state["fasta_input_val"] = fasta_text
 
         uniprot_id = st.text_input(
             "UniProt ID (for AlphaFold structure)",
-            value=st.session_state["uniprot_id_val"],
+            key="uniprot_id_val",
             placeholder="e.g. P62593 or BLAT_ECOLX",
             help="UniProt Accession or Entry Name used to query AlphaFold 3D coordinates.",
         )
-        st.session_state["uniprot_id_val"] = uniprot_id
 
-        msa_file = st.file_uploader("MSA file (.a2m, optional)", type=["a2m", "fasta", "fa"])
+        msa_file = st.file_uploader(
+            "MSA file (.a2m, optional)", type=["a2m", "fasta", "fa"],
+            key=f"msa_upload_{st.session_state.get('upload_generation', 0)}",
+        )
 
         # Check for bundled demo MSA
         tem1_msa_path = ROOT / "data" / "raw" / "msa" / "DMS_msa_files" / "BLAT_ECOLX_full_11-26-2021_b02.a2m"
@@ -1096,7 +1070,7 @@ def main():
         use_demo_msa = False
         if is_tem1_demo and tem1_msa_path.exists() and msa_file is None:
             use_demo_msa = st.checkbox(
-                "Use bundled TEM-1 reference MSA (286 cols, Neff/L = 100.8)",
+                "Use bundled TEM-1 reference MSA",
                 value=st.session_state.get("use_demo_msa_val", True),
                 help="Automatically loads the high-depth ProteinGym reference MSA for TEM-1 beta-lactamase.",
             )
@@ -1121,28 +1095,44 @@ def main():
                 "ESM-2 Model",
                 [
                     "esm2_t12_35M_UR50D (Fast, ~35M)",
-                    "esm2_t33_650M_UR50D (High Accuracy, ~650M)",
+                    "esm2_t33_650M_UR50D (650M parameters)",
                 ],
                 index=0,
                 help=(
                     "Choose ESM-2 model scale. "
                     "35M is fast and lightweight (recommended for quick iterations). "
-                    "650M provides higher zero-shot accuracy, recommended for shallow MSAs or GPU systems."
+                    "650M has no held-out result in this benchmark."
                 ),
             )
 
         run_btn = st.button("Score mutations", type="primary")
 
-    if not run_btn:
-        st.info("Fill in the sequence and UniProt ID in the sidebar, then click **Score mutations**.")
-        st.stop()
+    upload_digest = hashlib.sha256(msa_file.getbuffer()).hexdigest() if msa_file is not None else None
+    inputs = (fasta_text, uniprot_id, upload_digest, use_demo_msa, esm_model_choice)
+    if run_btn:
+        result = score_submission(fasta_text, uniprot_id, msa_file, use_demo_msa, tem1_msa_path, esm_model_choice)
+        st.session_state["completed_submission"] = (inputs, result)
+    if "completed_submission" not in st.session_state:
+        st.info("Fill in the sequence and UniProt ID, then click **Score mutations**.")
+        return
+    submitted, result = st.session_state["completed_submission"]
+    if inputs != submitted:
+        st.info("Inputs have changed. Showing the last completed submission.")
+    st.caption(f"Submitted result · {result['clean_id']} · {len(result['seq'])} residues")
+    render_result(**result, exclude_disordered=exclude_disordered, max_per_pos=max_per_pos)
 
+
+def score_submission(fasta_text, uniprot_id, msa_file, use_demo_msa, tem1_msa_path, esm_model_choice):
     # parse and validate inputs
     if not fasta_text.strip():
         st.error("Please provide a protein sequence.")
         st.stop()
 
-    seq = parse_fasta(fasta_text)
+    try:
+        seq = parse_fasta(fasta_text)
+    except ValueError as exc:
+        st.error(str(exc))
+        st.stop()
     is_valid, err_msg = validate_sequence(seq)
     if not is_valid:
         st.error(f"❌ {err_msg}")
@@ -1153,14 +1143,15 @@ def main():
         st.stop()
 
     clean_id = uniprot_id.strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", clean_id):
+        st.error("Use a UniProt identifier containing letters, digits, underscores or hyphens.")
+        st.stop()
     primary_acc, entry_name = resolve_uniprot_id(clean_id)
     selected_esm_model = (
         AVAILABLE_MODELS["650M"] if "650M" in esm_model_choice else AVAILABLE_MODELS["35M"]
     )
     model_tag = "650M" if "650M" in selected_esm_model else "35M"
 
-    with st.spinner("Loading models (one-time, ~10 s) …"):
-        ridge_full, ridge_fallback = load_baseline_models()
 
     # ---------------------------------------------------------------------------
     # multi-step scoring pipeline with progress bar
@@ -1170,7 +1161,7 @@ def main():
 
     FEAT_CACHE_DIR = ROOT / "data" / "processed" / "features"
     FEAT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    parquet_key = entry_name if entry_name else clean_id
+    parquet_key = hashlib.sha256(clean_id.encode()).hexdigest()
     parquet_file = FEAT_CACHE_DIR / f"{parquet_key}_{model_tag}.parquet"
 
     # Step 1/4: AlphaFold structure
@@ -1178,11 +1169,19 @@ def main():
     pdb_text = fetch_alphafold_pdb(clean_id)
 
     if pdb_text is None:
-        st.warning(f"Could not fetch AlphaFold structure for '{uniprot_id}'. RSA and pLDDT will be missing.")
-        rsa_dict, plddt_dict = {}, {}
-        ca_coords = {}
+        st.error("Structure unavailable. Required RSA coverage is missing.")
+        st.stop()
     else:
-        rsa_dict, plddt_dict = rsa_plddt_from_text(pdb_text)
+        from src.structure import validate_structure_mapping
+        try:
+            validate_structure_mapping(pdb_text, seq)
+            rsa_dict, plddt_dict = rsa_plddt_from_text(pdb_text)
+        except (ValueError, KeyError, IndexError) as exc:
+            st.error(f"Invalid structure: {exc}")
+            st.stop()
+        if any(not np.isfinite(rsa_dict.get(p, np.nan)) for p in range(1, len(seq) + 1)):
+            st.error("Structure has incomplete RSA coverage.")
+            st.stop()
         ca_coords = extract_ca_coords(pdb_text)
 
     low_plddt_positions = {p for p, v in plddt_dict.items() if v < 70}
@@ -1191,62 +1190,62 @@ def main():
     progress_bar.progress(50, text="Step 2/4: Processing MSA & computing conservation frequencies …")
     freq = None
     neff_L = None
-    is_verified_depth = False
+
     msa_mat = None
     if msa_file is not None:
-        msa_bytes = msa_file.read().decode()
-        tmp_path = ROOT / "data" / "processed" / "user_msa_tmp.a2m"
-        tmp_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path.write_text(msa_bytes)
-        _, msa_mat = load_msa(tmp_path)
+        try:
+            query, msa_mat = parse_msa(msa_file.getvalue().decode("utf-8-sig"))
+        except ValueError as exc:
+            st.error(f"Invalid alignment: {exc}")
+            st.stop()
     elif use_demo_msa and tem1_msa_path.exists():
-        _, msa_mat = load_msa(tem1_msa_path)
+        try:
+            query, msa_mat = load_msa(tem1_msa_path)
+        except ValueError as exc:
+            st.error(f"Invalid alignment: {exc}")
+            st.stop()
+
+    if msa_mat is not None and query != seq:
+        st.error("Alignment query does not match the submitted sequence.")
+        st.stop()
 
     if msa_mat is not None:
         freq = frequencies(msa_mat)
-        ref_map = get_reference_neff_dict()
-        ref_match = None
-        for cand in [clean_id.upper(), entry_name.upper(), primary_acc.upper()]:
-            if cand in ref_map:
-                ref_match = ref_map[cand]
-                break
-        if ref_match is not None:
-            neff_L = ref_match
-            is_verified_depth = True
-        else:
-            neff = compute_neff(msa_mat, theta=0.8)
+        neff = compute_neff(msa_mat, theta=0.8)
+        if np.isfinite(neff):
             neff_L = neff / len(seq)
-            is_verified_depth = False
 
     # Check if pre-computed feature parquet exists and matches current sequence
-    valid_cache = is_valid_feature_cache(parquet_file, seq)
+    valid_cache = msa_file is None and is_valid_feature_cache(parquet_file, seq, with_alignment=freq is not None)
 
     if valid_cache:
         progress_bar.progress(85, text=f"Loading features from cache ({parquet_file.name}) …")
         df = pd.read_parquet(parquet_file)
-        if freq is not None and "evo" not in df.columns:
-            cols = df["pos"].to_numpy() - 1
-            df["evo"] = evo_scores(freq, cols, df["wt"], df["mt"])
-            df["entropy"] = site_entropy(freq)[cols]
-            df.to_parquet(parquet_file, index=False)
     else:
         # Step 3/4: ESM-2
         progress_bar.progress(75, text=f"Step 3/4: Generating ESM-2 ({model_tag}) zero-shot log-likelihoods …")
         tok, _ = _load_model(selected_esm_model)
-        esm_cache_key = entry_name if entry_name else clean_id
+        esm_cache_key = parquet_key
         logprobs = score_sequence(seq, esm_cache_key, model_name=selected_esm_model)
 
         # Step 4/4: Scoring & Ranking
         progress_bar.progress(90, text="Step 4/4: Evaluating ensemble weights & ranking variants …")
         df = score_all_mutations(seq, freq, rsa_dict, plddt_dict, logprobs, tok)
-        # Cache computed features to parquet for instant future runs
-        df.to_parquet(parquet_file, index=False)
+        if msa_file is None:
+            with atomic_output(parquet_file) as pending:
+                df.to_parquet(pending, index=False)
 
-    if "plddt" in df.columns:
-        df["low_plddt"] = df["plddt"].apply(lambda v: "⚠️ < 70" if pd.notna(v) and v < 70 else "✅ ≥ 70")
-    else:
-        df["low_plddt"] = "N/A"
+    required = FEATURES_FULL if freq is not None else FEATURES_FALLBACK
+    if not set(required).issubset(df.columns) or not np.isfinite(df[required].to_numpy()).all():
+        st.error("Required scoring features are missing or incomplete.")
+        st.stop()
+    if "plddt" not in df:
+        df["plddt"] = np.nan
+    df["low_plddt"] = df["plddt"].apply(lambda v: "Unknown" if pd.isna(v) else ("⚠️ < 70" if v < 70 else "✅ ≥ 70"))
 
+
+    with st.spinner("Loading models (one-time, ~10 s) …"):
+        ridge_full, ridge_fallback = load_baseline_models()
 
     # Fallback model scores (always computed using BLOSUM + RSA + ESM)
     feat_fallback = df[FEATURES_FALLBACK].copy()
@@ -1258,6 +1257,7 @@ def main():
 
     # Full model scores (computed when MSA is uploaded)
     has_full = freq is not None
+    feat_full = None
     if has_full:
         feat_full = df[FEATURES_FULL].copy()
         for c in FEATURES_FULL:
@@ -1274,10 +1274,30 @@ def main():
     time.sleep(0.3)
     progress_bar.empty()
 
-    # ---------------------------------------------------------------------------
-    # notices & warnings
-    # ---------------------------------------------------------------------------
+    return {
+        "seq": seq,
+        "clean_id": clean_id,
+        "primary_acc": primary_acc,
+        "entry_name": entry_name,
+        "model_tag": model_tag,
+        "pdb_text": pdb_text,
+        "rsa_dict": rsa_dict,
+        "plddt_dict": plddt_dict,
+        "ca_coords": ca_coords,
+        "low_plddt_positions": low_plddt_positions,
+        "neff_L": neff_L,
+        "has_full": has_full,
+        "df": df,
+        "ridge_full": ridge_full,
+        "ridge_fallback": ridge_fallback,
+        "feat_full": feat_full,
+        "feat_fallback": feat_fallback,
+    }
 
+
+def render_result(*, seq, clean_id, primary_acc, entry_name, model_tag, pdb_text, rsa_dict,
+                  plddt_dict, ca_coords, low_plddt_positions, neff_L, has_full, df, ridge_full,
+                  ridge_fallback, feat_full, feat_fallback, exclude_disordered, max_per_pos):
     # TEM-1 Ambler numbering warning
     is_tem1 = any(c in ["BLAT_ECOLX", "P62593", "TEM-1", "TEM1", "TEM_1"] for c in [clean_id.upper(), entry_name.upper(), primary_acc.upper()])
     if is_tem1:
@@ -1292,13 +1312,13 @@ def main():
     if any(c in training_uniprots for c in [clean_id.upper(), entry_name.upper(), primary_acc.upper()]):
         st.info(
             "ℹ️ **In-sample demonstration**: This protein was part of the training set. "
-            "For strict zero-shot evaluation, test on a held-out protein (e.g. UBC9_HUMAN)."
+            "For strict zero-shot evaluation, use a protein absent from the training cohort."
         )
 
-    # Biological Interpretation Warning
+    # Scope of the retrospective benchmark
     st.info(
-        "ℹ️ **Biological Interpretation**: High scores indicate substitutions that are evolutionary tolerated "
-        "and structurally benign (the protein is likely to fold and retain function). "
+        "ℹ️ **Biological Interpretation**: Scores are relative ranks within this submission. "
+        "The filtered shortlist and fallback model have no held-out precision estimate. "
         "High scores **do not guarantee improved catalytic activity or binding affinity** over wild-type."
     )
 
@@ -1310,17 +1330,19 @@ def main():
     col1, col2, col3 = st.columns(3)
     with col1:
         if neff_L is not None:
-            depth_badge = "(ProteinGym reference)" if is_verified_depth else "[Estimated / Unverified depth]"
+            depth_badge = "(estimated from this alignment)"
             if neff_L < 10:
-                st.warning(f"⚠️ Shallow MSA — Neff/L = {neff_L:.1f} (< 10) {depth_badge}. Evolutionary signal is unreliable.")
+                st.warning(f"⚠️ Shallow MSA — Neff/L = {neff_L:.1f} (< 10) {depth_badge}. Depth alone does not establish ranking accuracy.")
             else:
-                st.success(f"✅ MSA depth OK — Neff/L = {neff_L:.1f} {depth_badge}")
+                st.success(f"MSA depth — Neff/L = {neff_L:.1f} {depth_badge}")
         else:
-            st.info("No MSA uploaded — using fallback model (ESM-2 + BLOSUM + RSA).")
+            st.info("Alignment depth unavailable for this size." if has_full else "No MSA uploaded — using fallback model (ESM-2 + BLOSUM + RSA).")
     with col2:
+        if df["plddt"].isna().any():
+            st.info("Structural confidence is unknown at one or more positions.")
         if low_plddt_positions:
             st.warning(f"⚠️ {len(low_plddt_positions)} positions have pLDDT < 70 (unreliable structure).")
-        elif pdb_text:
+        elif pdb_text and df["plddt"].notna().all():
             st.success("✅ All positions have pLDDT ≥ 70.")
     with col3:
         model_label = "Full (Evo + Structure + ESM-2)" if has_full \
@@ -1338,6 +1360,12 @@ def main():
         filter_note = f" *(excluded {len(low_plddt_positions)} disordered positions with pLDDT < 70, capped at max {max_per_pos}/position)*"
     else:
         filter_note = f" *(capped at max {max_per_pos}/position)*"
+
+    if candidate_df.empty:
+        st.info("No eligible substitutions. Adjust the results filters to view candidates.")
+        st.download_button("Download complete landscape CSV", df.to_csv(index=False),
+                           f"{clean_id}_complete_landscape.csv", "text/csv")
+        return
 
     if has_full:
         tab_full, tab_fallback, tab_shift, tab_3d, tab_double = st.tabs([
@@ -1364,7 +1392,7 @@ def main():
             full_landscape_cols = ["pos", "wt", "mt", "mutant", "score_full", "tier_full", "rank_full", "evo", "entropy", "blosum", "rsa", "plddt", "esm"]
             full_export_df = df[full_landscape_cols].copy().rename(columns={
                 "score_full": "final_score",
-                "tier_full": "confidence_tier",
+                "tier_full": "rank_tier",
                 "rank_full": "model_rank",
             }).sort_values(by="final_score", ascending=False)
             float_cols = [c for c in full_export_df.columns if full_export_df[c].dtype in ("float64", "float32")]
@@ -1416,7 +1444,7 @@ def main():
             fb_landscape_cols = ["pos", "wt", "mt", "mutant", "score_fallback", "tier_fallback", "rank_fallback", "blosum", "rsa", "plddt", "esm"]
             fb_export_df = df[fb_landscape_cols].copy().rename(columns={
                 "score_fallback": "final_score",
-                "tier_fallback": "confidence_tier",
+                "tier_fallback": "rank_tier",
                 "rank_fallback": "model_rank",
             }).sort_values(by="final_score", ascending=False)
             float_cols = [c for c in fb_export_df.columns if fb_export_df[c].dtype in ("float64", "float32")]
@@ -1553,7 +1581,7 @@ def main():
             fb_landscape_cols = ["pos", "wt", "mt", "mutant", "score_fallback", "tier_fallback", "rank_fallback", "blosum", "rsa", "plddt", "esm"]
             fb_export_df = df[fb_landscape_cols].copy().rename(columns={
                 "score_fallback": "final_score",
-                "tier_fallback": "confidence_tier",
+                "tier_fallback": "rank_tier",
                 "rank_fallback": "model_rank",
             }).sort_values(by="final_score", ascending=False)
             float_cols = [c for c in fb_export_df.columns if fb_export_df[c].dtype in ("float64", "float32")]
