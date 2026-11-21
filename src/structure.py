@@ -4,6 +4,7 @@ from typing import Dict, Tuple, Union
 
 import numpy as np
 from Bio.PDB import PDBParser
+from Bio.PDB.PDBExceptions import PDBConstructionException
 from Bio.PDB.SASA import ShrakeRupley
 from Bio.SeqUtils import seq1
 
@@ -14,6 +15,23 @@ MAXASA: Dict[str, float] = dict(
     H=224, I=197, L=201, K=236, M=224, F=240, P=159, S=155,
     T=172, W=285, Y=263, V=174
 )
+
+
+def validate_structure_mapping(text: str, sequence: str) -> None:
+    """Require an unambiguous sequential mapping before using position-keyed data."""
+    try:
+        models = list(PDBParser(QUIET=True, PERMISSIVE=False).get_structure("input", io.StringIO(text)))
+    except PDBConstructionException as exc:
+        raise ValueError(f"Ambiguous or malformed structure: {exc}") from exc
+    if len(models) != 1 or len(list(models[0])) != 1:
+        raise ValueError("Expected exactly one model and one chain.")
+    chain = next(models[0].get_chains())
+    residues = [r for r in chain if r.id[0] == " "]
+    if len(residues) != len(sequence):
+        raise ValueError("Structure does not cover the entire submitted sequence.")
+    for position, (residue, aa) in enumerate(zip(residues, sequence), 1):
+        if residue.id != (" ", position, " ") or seq1(residue.resname) != aa or residue.is_disordered() == 2:
+            raise ValueError(f"Ambiguous or mismatched structure mapping at position {position}.")
 
 
 def compute_rsa_plddt(pdb_source: Union[str, Path]) -> Tuple[Dict[int, float], Dict[int, float]]:
