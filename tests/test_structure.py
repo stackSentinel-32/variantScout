@@ -6,6 +6,7 @@ from src.data import ROOT
 from src.structure import compute_rsa_plddt, STRUCT_DIR
 
 
+@pytest.mark.integration
 def test_structure_rsa_plddt_parsing():
     """Verify parsing of AlphaFold PDB structure into RSA and pLDDT dictionaries."""
     pdb_file = "BLAT_ECOLX.pdb"
@@ -44,6 +45,7 @@ def test_structure_rsa_plddt_parsing():
     assert np.isclose(plddt_str[68], plddt[68], atol=1e-4)
 
 
+@pytest.mark.integration
 def test_ca_coordinates_and_distance():
     """Verify C-alpha coordinate extraction and 3D Euclidean distance calculation."""
     from src.structure import extract_ca_coords, compute_ca_distance

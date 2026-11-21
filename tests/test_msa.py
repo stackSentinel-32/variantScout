@@ -7,6 +7,7 @@ from src.data import ROOT, load_reference
 from src.msa import load_msa, frequencies, compute_neff
 
 
+@pytest.mark.integration
 def test_msa_loading_and_frequencies():
     """Verify MSA parsing and regularized frequency computation."""
     msa_path = ROOT / "data" / "raw" / "msa" / "DMS_msa_files" / "BLAT_ECOLX_full_11-26-2021_b02.a2m"
@@ -44,6 +45,7 @@ def test_compute_neff_reweighting():
     assert np.isclose(neff_distinct, 4.0), f"Expected Neff=4.0 for 4 distinct seqs, got {neff_distinct}"
 
 
+@pytest.mark.integration
 def test_reference_neff_l():
     """Verify that reference Neff/L for BLAT_ECOLX matches ProteinGym benchmark within tolerance."""
     ref = load_reference()

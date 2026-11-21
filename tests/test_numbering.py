@@ -21,6 +21,7 @@ def test_ambler_mapping():
     assert ambler_s70 == 70, "App position 68 must map to Ambler S70"
 
 
+@pytest.mark.integration
 def test_tem1_m180t_and_s68a_sanity():
     """Verify M180T (stabilizer) scores in top tier and S68A (catalytic serine) is buried."""
     # 1. Evolutionary score sanity check

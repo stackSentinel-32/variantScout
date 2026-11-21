@@ -20,6 +20,7 @@ def test_available_models():
     assert "facebook/esm2_t33_650M_UR50D" in AVAILABLE_MODELS["650M"]
 
 
+@pytest.mark.integration
 def test_model_caching():
     """Verify model weights are cached per model key."""
     tok, model = _load_model(MODEL_NAME)
@@ -29,6 +30,7 @@ def test_model_caching():
     assert f"{MODEL_NAME}_model" in _model_cache
 
 
+@pytest.mark.integration
 def test_esm_mutation_scores_computation():
     """Test log-odds mutation scoring calculation."""
     tok, _ = _load_model(MODEL_NAME)
