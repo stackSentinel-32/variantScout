@@ -18,7 +18,7 @@ WORKDIR /app
 
 # Install Python dependencies first for caching layers
 COPY requirements.txt .
-RUN pip install -r requirements.txt && pip install pytest
+RUN pip install -r requirements.txt
 
 # Copy application source code and configurations
 COPY . .

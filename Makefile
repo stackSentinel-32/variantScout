@@ -1,19 +1,17 @@
-# Mutation Picker – common tasks
-# Usage: make <target>
-# Requires: Python venv at .venv/  (make install creates it)
-
-PYTHON = .venv/Scripts/python.exe
-PIP    = .venv/Scripts/pip.exe
+ifeq ($(OS),Windows_NT)
+PYTHON ?= .venv/Scripts/python.exe
+else
+PYTHON ?= .venv/bin/python
+endif
 
 .PHONY: install baseline evaluate app test reproduce
 
-test:
-	$(PYTHON) -m pytest -v
-
-
 install:
 	python -m venv .venv
-	$(PIP) install -r requirements.txt
+	$(PYTHON) -m pip install -r requirements.txt
+
+test:
+	$(PYTHON) -m pytest -v
 
 baseline:
 	$(PYTHON) -m src.baseline
@@ -22,8 +20,6 @@ evaluate:
 	$(PYTHON) -m src.evaluate
 
 app:
-	.venv/Scripts/streamlit.exe run app/app.py
+	$(PYTHON) -m streamlit run app/app.py
 
-# Regenerates every artifact from raw data in order.
 reproduce: baseline evaluate
-	@echo "All results regenerated."
